@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Secrets — never commit
+.env
+*.key
+
+# Generated CAD artifacts — do not version
+generated/
+
+# OS
+.DS_Store
