@@ -9,7 +9,7 @@ or the environment — instead of debugging three unknowns at once.
 Run:  python phase0_cube.py
 Out:  generated/cube.stl  and  generated/cube.png
 
-Notes on the render step (the fiddly part):
+Notes on the render step (VTK env vars MUST be set BEFORE the cadquery.vis import) (the fiddly part):
 - CadQuery's STL export is rock-solid and dependency-light. That always works.
 - PNG rendering goes through VTK, which wants a display. On a headless machine
   (CI, a server, or a Mac running without a window context) you must force VTK
