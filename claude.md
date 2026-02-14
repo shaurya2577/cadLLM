@@ -9,7 +9,7 @@ real 3D model (STL/STEP) and a rendered preview. The user refines either
 (a) in natural language or (b) by editing exposed named parameters.
 
 ## Hard decisions
-- **CAD kernel: `build123d`** (Python, OCCT-backed B-rep). Geometry is always
+- **CAD kernel: `CadQuery`** (changed from build123d — see note below) (Python, OCCT-backed B-rep). Geometry is always
   emitted as readable Python.
 - Generated code exposes named parameters at the top of every script.
 - Every part renders to a PNG for inspection. Rendering is headless.
@@ -25,3 +25,9 @@ real 3D model (STL/STEP) and a rendered preview. The user refines either
 - Python ≥ 3.11, local venv (`.venv`).
 - API key in `.env`, never commit. Add a `.gitignore`.
 - Headless rendering on macOS is the fiddliest setup step.
+
+## Note on kernel switch (2026-02-14)
+
+build123d has cleaner Python ergonomics but the LLM tends to mis-emit
+selectors and operators against it. CadQuery has more training data in
+the wild and the VTK PNG path works headless. Sticking with CadQuery.
