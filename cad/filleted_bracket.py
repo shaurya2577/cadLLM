@@ -12,6 +12,8 @@ FILLET_RADIUS = 4.0   # mm — outer corner fillet on the base plate
 HOLE_DIAMETER = 4.0   # mm — mounting-hole diameter
 HOLE_INSET    = 6.0   # mm — distance from hole centre to nearest base edge
 
+# NB: CadQuery's string selector grammar doesn't support `and not(...)` — pre-fillet
+# subcomponents before union, or use the selectors Python API.
 # ---- geometry -----------------------------------------------------------------
 # Asymmetric part → base sits ON the XY plane, Z is up. Build the base, fillet the
 # top corners of the base (which are the "outer" corners when looking down), drill
