@@ -34,6 +34,8 @@ SCREW_SPACING       = 50.0  # mm — centre-to-centre
 FRONT_LIP_HEIGHT = 10.0  # mm
 FRONT_LIP_THICK  = 5.0   # mm
 
+# Corner softening (fillet radius must be < adjacent face thickness / 2,
+# otherwise BRep_API: command not done. Hard lesson with the 6mm back plate.)
 # Corner softening (small enough to fit on the 6mm thickness)
 CORNER_FILLET   = 2.5    # mm
 
