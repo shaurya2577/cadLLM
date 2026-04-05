@@ -1,0 +1,3 @@
+body { font: 14px system-ui; padding: 16px; }
+canvas { border: 1px solid #ccc; background: #fff; cursor: crosshair; }
+label, button { margin: 4px 8px 4px 0; }
