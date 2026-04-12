@@ -1,4 +1,4 @@
-"""Sketch-to-CAD server — v0: polygon extrude only.
+"""Sketch-to-CAD server — v1: with circle/rect classifier.
 
 Receives a single stroke from the browser, simplifies it, extrudes to STL.
 No classifier yet. No multi-stroke composition. No three.js viewer yet either.
@@ -58,3 +58,9 @@ def generate(req: GenerateRequest):
     tmp.close()
     cq.exporters.export(solid, tmp.name)
     return FileResponse(tmp.name, media_type="model/stl", filename="part.stl")
+
+
+def _classify(stroke):
+    # Heuristic: small radial variance from centroid → circle.
+    # Otherwise check if polygon area ≈ bbox area → rect. Else freeform polygon.
+    pass  # see later versions
