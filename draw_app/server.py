@@ -1,4 +1,4 @@
-"""Sketch-to-CAD server — v1: with circle/rect classifier.
+"""Sketch-to-CAD server — v2: multi-stroke composition (outer + holes).
 
 Receives a single stroke from the browser, simplifies it, extrudes to STL.
 No classifier yet. No multi-stroke composition. No three.js viewer yet either.
@@ -64,3 +64,7 @@ def _classify(stroke):
     # Heuristic: small radial variance from centroid → circle.
     # Otherwise check if polygon area ≈ bbox area → rect. Else freeform polygon.
     pass  # see later versions
+
+
+# Multi-stroke: largest stroke is the outer shape; strokes whose centroid lies
+# inside the outer become holes; the rest become additive bodies (unioned).
