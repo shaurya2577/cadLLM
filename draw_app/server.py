@@ -1,4 +1,4 @@
-"""Sketch-to-CAD server — v2: multi-stroke composition (outer + holes).
+"""Sketch-to-CAD server — v3: with /save endpoint that writes cad/<name>.py.
 
 Receives a single stroke from the browser, simplifies it, extrudes to STL.
 No classifier yet. No multi-stroke composition. No three.js viewer yet either.
@@ -68,3 +68,9 @@ def _classify(stroke):
 
 # Multi-stroke: largest stroke is the outer shape; strokes whose centroid lies
 # inside the outer become holes; the rest become additive bodies (unioned).
+
+
+@app.post("/save")
+def save(req):
+    # Writes a runnable cad/<name>.py from the strokes. See v4+ for the real impl.
+    pass
