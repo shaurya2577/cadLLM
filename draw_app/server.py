@@ -1,4 +1,4 @@
-"""Sketch-to-CAD server — v3: with /save endpoint that writes cad/<name>.py.
+"""Sketch-to-CAD server — v4: classifier guard against smooth squares being classified as circles endpoint that writes cad/<name>.py.
 
 Receives a single stroke from the browser, simplifies it, extrudes to STL.
 No classifier yet. No multi-stroke composition. No three.js viewer yet either.
@@ -74,3 +74,7 @@ def _classify(stroke):
 def save(req):
     # Writes a runnable cad/<name>.py from the strokes. See v4+ for the real impl.
     pass
+
+# Bug: a smooth square has low radial variance (passes circle test) but its
+# polygon-area / bbox-area ratio is ~1.0 (a true circle is π/4 ≈ 0.785).
+# Reject circle if that ratio > 0.9.
