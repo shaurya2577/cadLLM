@@ -1,3 +1,206 @@
-body { font: 14px system-ui; padding: 16px; }
-canvas { border: 1px solid #ccc; background: #fff; cursor: crosshair; }
-label, button { margin: 4px 8px 4px 0; }
+:root {
+  color-scheme: light dark;
+  --bg: #fafafa;
+  --fg: #222;
+  --muted: #777;
+  --accent: #2962ff;
+  --accent-soft: rgba(41, 98, 255, 0.15);
+  --border: #d0d0d0;
+  --panel: #fff;
+  --canvas-bg: #ffffff;
+  --grid: rgba(120, 120, 120, 0.16);
+  --error: #e53935;
+  --ok: #43a047;
+  --outer: #2962ff;
+  --hole: #e53935;
+  --additive: #43a047;
+  --skip: #888;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141414;
+    --fg: #ececec;
+    --muted: #9a9a9a;
+    --border: #303030;
+    --panel: #1d1d1d;
+    --canvas-bg: #1d1d1d;
+    --grid: rgba(180, 180, 180, 0.10);
+    --accent-soft: rgba(41, 98, 255, 0.22);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+header {
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  background: var(--panel);
+}
+header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+header h1 .muted { color: var(--muted); font-weight: 400; }
+.controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.controls label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.controls label.check { gap: 4px; }
+.controls input[type="number"] {
+  width: 60px; padding: 3px 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--fg); border-radius: 4px;
+  font: inherit;
+}
+.controls select { padding: 3px 6px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--fg); border-radius: 4px; font: inherit; }
+.controls button { padding: 5px 12px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--fg); border-radius: 4px; cursor: pointer; font: inherit; }
+.controls button#generate { background: var(--accent); color: white; border-color: var(--accent); }
+.controls button:hover { filter: brightness(1.08); }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(360px, 1.1fr) minmax(360px, 1fr);
+  gap: 1px;
+  background: var(--border);
+  height: calc(100vh - 56px);
+}
+.pane { background: var(--bg); padding: 12px 16px; display: flex; flex-direction: column; min-height: 0; }
+.pane-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.pane-head h2 { margin: 0; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.small { font-size: 11px; }
+
+/* Canvas pane */
+.canvas-wrap { position: relative; flex: 1; min-height: 0; }
+#sketch {
+  background: var(--canvas-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: 100%; height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.prompt-row {
+  display: flex; gap: 6px; margin-top: 10px;
+}
+.prompt-row input {
+  flex: 1; padding: 6px 10px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--fg); border-radius: 4px;
+  font: inherit;
+}
+.prompt-row button {
+  padding: 6px 12px; border: 1px solid var(--accent);
+  background: var(--accent); color: white; border-radius: 4px; cursor: pointer;
+}
+
+/* Inline input — anchored to a click position on the canvas */
+.inline-input {
+  position: absolute;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+  z-index: 10;
+  padding: 4px 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 180px;
+}
+.inline-input.hidden { display: none; }
+.inline-input input {
+  padding: 4px 6px;
+  border: none; outline: none;
+  background: transparent; color: var(--fg);
+  font: inherit;
+  width: 100%;
+}
+.inline-help {
+  font-size: 11px; color: var(--muted);
+}
+
+/* Interpretation chips */
+.interpretation {
+  margin-top: 8px;
+  display: flex; flex-wrap: wrap; gap: 5px;
+  min-height: 24px;
+}
+.chip {
+  font-size: 11px;
+  padding: 3px 7px;
+  border: 1px solid;
+  border-radius: 12px;
+  background: var(--panel);
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.chip .idx {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--role, var(--muted));
+  color: #fff;
+  text-align: center;
+  font-size: 9px;
+  line-height: 14px;
+  font-weight: 600;
+}
+
+/* 3D viewer */
+.viewer-pane { gap: 0; }
+#viewer {
+  background: var(--canvas-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  flex: 1; min-height: 220px;
+  position: relative;
+  overflow: hidden;
+}
+#viewer canvas { display: block; width: 100% !important; height: 100% !important; }
+
+/* Timeline */
+.timeline-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-top: 12px; margin-bottom: 6px;
+}
+.timeline-head h3 { margin: 0; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.timeline {
+  list-style: none; margin: 0; padding: 0;
+  max-height: 200px; overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.timeline li {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px;
+}
+.timeline li:last-child { border-bottom: none; }
+.timeline li.error { color: var(--error); }
+.timeline li.ok { /* default */ }
+.timeline li .op-num {
+  display: inline-block; width: 18px; text-align: right;
+  font-family: ui-monospace, monospace; font-size: 10px; color: var(--muted);
+}
+.timeline li .op-type {
+  font-weight: 600;
+  font-size: 11px;
+  padding: 2px 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 3px;
+}
+.timeline li .op-summary { flex: 1; }
+.timeline li .op-delete {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 14px; padding: 0 6px;
+}
+.timeline li .op-delete:hover { color: var(--error); }
+.timeline-empty {
+  padding: 14px; text-align: center; color: var(--muted); font-size: 12px;
+}
+
+#status { font-size: 12px; }
+#status.error { color: var(--error); }
+#status.ok { color: var(--ok); }

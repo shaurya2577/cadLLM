@@ -1,14 +1,77 @@
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>cadLLM sketch</title>
-<link rel="stylesheet" href="/static/style.css">
-<script type="importmap">
-{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"}}
-</script></head>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cadLLM — sketch &amp; word</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
 <body>
-<header>cadLLM sketch → CAD</header>
-<main>
-  <section><canvas id="sketch" width="600" height="600"></canvas></section>
-  <section><div id="viewer"></div></section>
-</main>
-<script type="module" src="/static/app.js"></script>
-</body></html>
+  <header>
+    <h1>cadLLM <span class="muted">sketch &amp; word</span></h1>
+    <div class="controls">
+      <label>Height <input id="height" type="number" value="10" min="0.5" step="0.5" /> mm</label>
+      <label>Size <input id="size" type="number" value="60" min="5" step="5" /> mm</label>
+      <label>Plane
+        <select id="plane">
+          <option value="XY">XY (base)</option>
+          <option value="top">Top of last extrude</option>
+          <option value="bottom">Bottom of last extrude</option>
+        </select>
+      </label>
+      <label class="check"><input id="snap" type="checkbox" /> Snap</label>
+      <label class="check"><input id="live" type="checkbox" checked /> Live</label>
+      <button id="generate">Build</button>
+      <button id="undo" title="Remove the last stroke">Undo stroke</button>
+      <button id="clear">Clear</button>
+      <button id="save">Save as part…</button>
+      <span id="status" class="muted">Ready. Draw a closed shape, then click on or near it to annotate.</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="pane canvas-pane">
+      <div class="pane-head">
+        <h2>Sketch</h2>
+        <span class="muted small">click a stroke to annotate · click empty canvas for a command</span>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="sketch" width="600" height="600"></canvas>
+        <!-- Floating inline input — positioned absolutely over the canvas when active. -->
+        <div id="inlineInput" class="inline-input hidden">
+          <input id="inlineInputField" type="text" placeholder="" autocomplete="off" />
+          <div id="inlineInputHelp" class="inline-help"></div>
+        </div>
+      </div>
+      <div class="prompt-row">
+        <input id="globalPrompt" type="text" placeholder="Or type a global command:  e.g. fillet all edges 2mm" />
+        <button id="globalPromptGo">↵</button>
+      </div>
+      <div class="interpretation" id="interpretation"></div>
+    </section>
+
+    <section class="pane viewer-pane">
+      <div class="pane-head">
+        <h2>3D model</h2>
+        <span class="muted small">drag to orbit · scroll to zoom</span>
+      </div>
+      <div id="viewer"></div>
+      <div class="timeline-head">
+        <h3>Timeline</h3>
+        <span class="muted small">ordered ops · click × to remove</span>
+      </div>
+      <ol id="timeline" class="timeline"></ol>
+    </section>
+  </main>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
