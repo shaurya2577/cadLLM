@@ -19,7 +19,9 @@ Endpoints:
 from __future__ import annotations
 
 import base64
+import json
 import math
+import os
 import re
 import sys
 import tempfile
@@ -28,9 +30,25 @@ from typing import Annotated, Any, List, Literal, Optional, Tuple, Union
 
 import cadquery as cq
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
+
+
+def _load_env() -> None:
+    """Tiny .env loader; sets keys not already in os.environ. No external dep."""
+    env_path = Path(__file__).parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_env()
 
 ROOT = Path(__file__).parent
 PROJECT_ROOT = ROOT.parent
@@ -53,6 +71,9 @@ class Stroke(BaseModel):
     # Optional per-stroke annotations from the user — "this circle is 10mm dia"
     # or "this rect is 30mm wide." Overrides the pixel-derived size.
     annotation: Optional["StrokeAnnotation"] = None
+    # Construction strokes don't contribute to the extrusion; they serve as
+    # alignment scaffolding (axis of revolution, symmetry line, datum).
+    construction: bool = False
 
 
 class StrokeAnnotation(BaseModel):
@@ -65,6 +86,10 @@ class SketchExtrudeOp(BaseModel):
     strokes: List[Stroke]
     height_mm: float = Field(10.0, gt=0)
     plane: Literal["XY", "top", "bottom"] = "XY"
+    # Boolean operation against the existing model (Fusion's "operation" dropdown).
+    # new_body = ignore the existing model, replace it; join = union;
+    # cut = subtract the extruded volume; intersect = keep only the overlap.
+    mode: Literal["new_body", "join", "cut", "intersect"] = "join"
 
 
 class SketchCutOp(BaseModel):
@@ -115,10 +140,40 @@ class MirrorOp(BaseModel):
     plane: Literal["YZ", "XZ"] = "YZ"
 
 
+class RevolveOp(BaseModel):
+    """Revolve a profile stroke around an axis to produce a solid of revolution.
+
+    Profile = the largest non-construction closed stroke. Axis = the first
+    construction stroke OR the Y axis if none is provided. Sweep angle is
+    in degrees (default 360 = full revolution).
+    """
+    op: Literal["revolve"] = "revolve"
+    strokes: List[Stroke]
+    angle_deg: float = Field(360.0, gt=0, le=360.0)
+    axis: Literal["X", "Y", "X_canvas", "Y_canvas"] = "Y_canvas"
+
+
+class ShellOp(BaseModel):
+    """Hollow out a solid to a given wall thickness, optionally removing top/bottom faces."""
+    op: Literal["shell"] = "shell"
+    thickness_mm: float = Field(2.0, gt=0)
+    remove: Literal["top", "bottom", "none"] = "top"
+
+
+class CircularPatternOp(BaseModel):
+    """Pattern the most recent hole around a circular path."""
+    op: Literal["circular_pattern"] = "circular_pattern"
+    count: int = Field(4, ge=2)
+    radius_mm: float = Field(20.0, gt=0)
+    cx_mm: float = 0.0
+    cy_mm: float = 0.0
+
+
 Op = Annotated[
     Union[
         SketchExtrudeOp, SketchCutOp, HoleOp, FilletOp, ChamferOp,
         SetHeightOp, PatternLinearOp, MirrorOp,
+        RevolveOp, ShellOp, CircularPatternOp,
     ],
     Field(discriminator="op"),
 ]
@@ -166,11 +221,42 @@ class ParseRequest(BaseModel):
     text: str
     canvas_width: float = 600.0
     canvas_height: float = 600.0
+    use_llm: bool = True    # try the LLM fallback for unparsed lines
 
 
 class ParseResponse(BaseModel):
     operations: List[Op]
     unparsed: List[str]    # lines that didn't match any pattern
+    llm_used: bool = False  # true if the LLM helped translate any line
+
+
+class InspectRequest(BuildRequest):
+    pass
+
+
+class InspectResponse(BaseModel):
+    watertight: bool
+    is_volume: bool         # bounded volume (volume > 0)
+    volume_mm3: float
+    surface_area_mm2: float
+    bbox_mm: List[float]    # [dx, dy, dz]
+    n_triangles: int
+    issues: List[str]       # human-readable warnings
+
+
+class ExportRequest(BuildRequest):
+    format: Literal["stl", "step", "3mf", "glb", "obj"] = "stl"
+
+
+class PartsListResponse(BaseModel):
+    parts: List[dict]
+
+
+class OpenPartResponse(BaseModel):
+    name: str
+    docstring: str
+    parameters: List[dict]   # [{name, value, comment}]
+    source: str
 
 
 class SaveRequest(BuildRequest):
@@ -267,7 +353,13 @@ def generate(req: GenerateRequest) -> GenerateResponse:
 @app.post("/parse", response_model=ParseResponse)
 def parse_text(req: ParseRequest) -> ParseResponse:
     ops, unparsed = parse_prompt(req.text)
-    return ParseResponse(operations=ops, unparsed=unparsed)
+    llm_used = False
+    if unparsed and req.use_llm and os.environ.get("ANTHROPIC_API_KEY"):
+        llm_ops, still_unparsed = _llm_parse(unparsed)
+        ops.extend(llm_ops)
+        unparsed = still_unparsed
+        llm_used = bool(llm_ops)
+    return ParseResponse(operations=ops, unparsed=unparsed, llm_used=llm_used)
 
 
 @app.post("/save", response_model=SaveResponse)
@@ -285,6 +377,213 @@ def save(req: SaveRequest) -> SaveResponse:
         out = CAD_DIR / f"{req.save_as}_{i}.py"
     out.write_text(code)
     return SaveResponse(path=str(out.relative_to(PROJECT_ROOT)), bytes_written=len(code))
+
+
+@app.post("/inspect", response_model=InspectResponse)
+def inspect(req: InspectRequest) -> InspectResponse:
+    """Run trimesh on the built model and report basic geometric health."""
+    import trimesh
+    model, _feedback, _interps = _execute_ops(req)
+    if model is None:
+        raise HTTPException(400, "no geometry produced")
+    stl_bytes = _export_stl(model)
+    mesh = trimesh.load(io_stream(stl_bytes, ".stl"), file_type="stl")
+    issues: list[str] = []
+    if not mesh.is_watertight:
+        issues.append("mesh is not watertight (holes or open boundaries)")
+    if not mesh.is_volume:
+        issues.append("mesh does not bound a positive volume")
+    if mesh.bounding_box.extents.min() <= 1e-6:
+        issues.append("zero-thickness axis (degenerate bounding box)")
+    return InspectResponse(
+        watertight=bool(mesh.is_watertight),
+        is_volume=bool(mesh.is_volume),
+        volume_mm3=float(mesh.volume),
+        surface_area_mm2=float(mesh.area),
+        bbox_mm=[float(x) for x in mesh.bounding_box.extents],
+        n_triangles=int(len(mesh.faces)),
+        issues=issues,
+    )
+
+
+@app.post("/export")
+def export(req: ExportRequest):
+    """Export the built model in the requested format. Returns raw bytes."""
+    model, _feedback, _interps = _execute_ops(req)
+    if model is None:
+        raise HTTPException(400, "no geometry produced")
+    fmt = req.format.lower()
+    mime = {
+        "stl": "model/stl",
+        "step": "application/step",
+        "3mf": "model/3mf",
+        "glb": "model/gltf-binary",
+        "obj": "model/obj",
+    }[fmt]
+    tmp = tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False)
+    tmp.close()
+    try:
+        if fmt in ("stl", "step"):
+            cq.exporters.export(model, tmp.name)
+        elif fmt == "3mf":
+            # CadQuery doesn't export 3MF directly. Round-trip via trimesh.
+            import trimesh
+            stl_bytes = _export_stl(model)
+            mesh = trimesh.load(io_stream(stl_bytes, ".stl"), file_type="stl")
+            mesh.export(tmp.name, file_type="3mf")
+        elif fmt == "glb":
+            import trimesh
+            stl_bytes = _export_stl(model)
+            mesh = trimesh.load(io_stream(stl_bytes, ".stl"), file_type="stl")
+            mesh.export(tmp.name, file_type="glb")
+        elif fmt == "obj":
+            import trimesh
+            stl_bytes = _export_stl(model)
+            mesh = trimesh.load(io_stream(stl_bytes, ".stl"), file_type="stl")
+            mesh.export(tmp.name, file_type="obj")
+        data = Path(tmp.name).read_bytes()
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+    return Response(content=data, media_type=mime,
+                    headers={"Content-Disposition": f'attachment; filename="part.{fmt}"'})
+
+
+@app.get("/parts", response_model=PartsListResponse)
+def list_parts() -> PartsListResponse:
+    """List every cad/<name>.py with a quick summary."""
+    parts: list[dict] = []
+    if CAD_DIR.exists():
+        for p in sorted(CAD_DIR.glob("*.py")):
+            if p.name.startswith("_"):
+                continue
+            text = p.read_text()
+            # First docstring line.
+            m = re.match(r'\s*"""(.*?)"""', text, re.DOTALL)
+            doc = m.group(1).strip().split("\n")[0] if m else ""
+            # Whether the rendered PNG exists.
+            png = PROJECT_ROOT / "generated" / f"{p.stem}.png"
+            parts.append({
+                "name": p.stem,
+                "doc": doc,
+                "has_render": png.exists(),
+                "size_bytes": p.stat().st_size,
+            })
+    return PartsListResponse(parts=parts)
+
+
+@app.get("/open/{name}", response_model=OpenPartResponse)
+def open_part(name: str) -> OpenPartResponse:
+    """Read a cad/<name>.py file and return its parameters + docstring + source."""
+    if not re.match(r"^[a-z][a-z0-9_]*$", name):
+        raise HTTPException(400, "invalid name")
+    src = CAD_DIR / f"{name}.py"
+    if not src.exists():
+        raise HTTPException(404, f"cad/{name}.py not found")
+    text = src.read_text()
+    m = re.match(r'\s*"""(.*?)"""', text, re.DOTALL)
+    docstring = m.group(1).strip() if m else ""
+    params: list[dict] = []
+    for line in text.splitlines():
+        m = re.match(r'^([A-Z][A-Z0-9_]*)\s*=\s*([^#\n]+?)\s*(?:#\s*(.*))?$', line)
+        if m:
+            params.append({
+                "name": m.group(1),
+                "value": m.group(2).strip(),
+                "comment": (m.group(3) or "").strip(),
+            })
+        elif re.match(r'^(def |class |result\s*=|render\s*\()', line.lstrip()):
+            break
+    return OpenPartResponse(name=name, docstring=docstring, parameters=params, source=text)
+
+
+# ---- helpers ---------------------------------------------------------------
+
+def io_stream(data: bytes, suffix: str):
+    """Wrap bytes in a file-like object suitable for trimesh.load."""
+    import io
+    bio = io.BytesIO(data)
+    bio.name = f"buf{suffix}"
+    return bio
+
+
+def _llm_parse(unparsed_lines: list[str]) -> tuple[list[Op], list[str]]:
+    """Call Claude to translate freeform CAD instructions into ops.
+
+    Returns (parsed_ops, still_unparsed). Failure modes (no key, network error,
+    malformed JSON) all degrade gracefully — the unparsed lines are returned
+    unchanged so the frontend can show them to the user.
+    """
+    try:
+        import anthropic
+    except ImportError:
+        return [], unparsed_lines
+
+    client = anthropic.Anthropic()
+    schema = _ops_schema_for_prompt()
+    user_text = "\n".join(f"- {line}" for line in unparsed_lines)
+
+    system = (
+        "You are a CAD instruction parser. Translate plain-English CAD edit "
+        "instructions into a JSON array of operations against the schema below. "
+        "Return ONLY a JSON array — no prose, no markdown fences. "
+        "If a line cannot be translated, omit it.\n\n"
+        f"Schema:\n{schema}\n\n"
+        "Conventions:\n"
+        "- All lengths in mm. Default values: fillet radius 2mm, chamfer 1mm, "
+        "hole diameter 5mm, height 10mm.\n"
+        "- 'fillet the corners' → fillet target='vertical'.\n"
+        "- 'round the top' → fillet target='top'.\n"
+        "- 'mirror it' → mirror across YZ.\n"
+        "- Coordinates default to (0, 0) when 'at center' or unspecified."
+    )
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=system,
+            messages=[{"role": "user", "content": user_text}],
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        # Strip any fences just in case.
+        text = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.MULTILINE)
+        ops_raw = json.loads(text)
+        if not isinstance(ops_raw, list):
+            return [], unparsed_lines
+        parsed: list[Op] = []
+        for raw in ops_raw:
+            try:
+                # Use the discriminated-union machinery: each item must have an "op" key.
+                # We validate via the Op annotation through a small adapter request.
+                op_type = raw.get("op")
+                cls = {
+                    "fillet": FilletOp, "chamfer": ChamferOp, "hole": HoleOp,
+                    "set_height": SetHeightOp, "mirror": MirrorOp,
+                    "pattern_linear": PatternLinearOp, "circular_pattern": CircularPatternOp,
+                    "shell": ShellOp,
+                }.get(op_type)
+                if cls is None:
+                    continue
+                parsed.append(cls(**raw))
+            except Exception:
+                continue
+        # Everything parsed successfully → no remaining unparsed lines.
+        return parsed, [] if parsed else unparsed_lines
+    except Exception:
+        return [], unparsed_lines
+
+
+def _ops_schema_for_prompt() -> str:
+    return """[
+  {"op": "fillet", "radius_mm": float, "target": "all"|"top"|"bottom"|"vertical"},
+  {"op": "chamfer", "distance_mm": float, "target": "all"|"top"|"bottom"|"vertical"},
+  {"op": "hole", "x_mm": float, "y_mm": float, "diameter_mm": float, "depth_mm": float|null, "plane": "XY"|"top"|"bottom"},
+  {"op": "set_height", "value_mm": float},
+  {"op": "mirror", "plane": "YZ"|"XZ"},
+  {"op": "pattern_linear", "axis": "x"|"y", "count": int, "spacing_mm": float},
+  {"op": "circular_pattern", "count": int, "radius_mm": float, "cx_mm": float, "cy_mm": float},
+  {"op": "shell", "thickness_mm": float, "remove": "top"|"bottom"|"none"}
+]"""
 
 
 # ============================================================================
@@ -339,16 +638,25 @@ def _execute_ops(
     for i, op in enumerate(req.operations):
         try:
             if isinstance(op, SketchExtrudeOp):
-                to_cad, _ = to_cad_factory(req, op.strokes)
+                # Filter out construction strokes — they don't extrude.
+                geom_strokes = [s for s in op.strokes if not s.construction]
+                to_cad, _ = to_cad_factory(req, geom_strokes)
                 if to_cad is None:
                     feedback.append(OpFeedback(index=i, op=op.op, status="error",
-                                                summary="no strokes"))
+                                                summary="no non-construction strokes"))
                     continue
                 # Per-stroke classify, then compose by extruding outer + booleaning
                 # additives and holes. (CadQuery doesn't expose 2D face booleans
                 # on a Workplane, so we do the composition at the 3D level.)
                 valid: list[tuple[int, list[Point], tuple[str, dict]]] = []
                 for orig_idx, s in enumerate(op.strokes):
+                    if s.construction:
+                        interps.append(StrokeInterpretation(
+                            op_index=i, stroke_index=orig_idx, kind="polygon",
+                            role="construction",
+                            description="construction (not extruded)",
+                        ))
+                        continue
                     if len(s.points) < 5:
                         interps.append(StrokeInterpretation(
                             op_index=i, stroke_index=orig_idx, kind="polygon",
@@ -393,13 +701,18 @@ def _execute_ops(
                 z_offset = _plane_z_offset(model, op.plane)
                 if z_offset != 0:
                     extrusion = extrusion.translate((0, 0, z_offset))
-                if model is None:
+                # Boolean compose per the Fusion-style mode.
+                if model is None or op.mode == "new_body":
                     model = extrusion
-                else:
+                elif op.mode == "join":
                     model = model.union(extrusion)
+                elif op.mode == "cut":
+                    model = model.cut(extrusion)
+                elif op.mode == "intersect":
+                    model = model.intersect(extrusion)
                 last_extrude_height = op.height_mm
                 feedback.append(OpFeedback(index=i, op=op.op, status="ok",
-                                            summary=f"extruded {len(op.strokes)} stroke(s) by {op.height_mm:.1f}mm"))
+                                            summary=f"extruded {len(valid)} feature(s) by {op.height_mm:.1f}mm · mode={op.mode}"))
 
             elif isinstance(op, SketchCutOp):
                 if model is None:
@@ -526,6 +839,117 @@ def _execute_ops(
                 model = model.union(mirrored)
                 feedback.append(OpFeedback(index=i, op=op.op, status="ok",
                                             summary=f"mirror across {op.plane}"))
+
+            elif isinstance(op, RevolveOp):
+                # Build a profile face from the largest non-construction stroke,
+                # then revolve around the chosen axis. Auto-shift the profile so
+                # it sits entirely on one side of the axis (CadQuery's revolve
+                # requires this — profiles crossing the axis fail with BRep_API).
+                geom_strokes = [s for s in op.strokes if not s.construction]
+                to_cad, _ = to_cad_factory(req, geom_strokes)
+                if to_cad is None:
+                    feedback.append(OpFeedback(index=i, op=op.op, status="error",
+                                                summary="no profile strokes"))
+                    continue
+                profiles = []
+                for s in geom_strokes:
+                    if len(s.points) < 5:
+                        continue
+                    pts = [to_cad(p) for p in s.points]
+                    profiles.append((pts, _classify(pts)))
+                if not profiles:
+                    feedback.append(OpFeedback(index=i, op=op.op, status="error",
+                                                summary="no usable profile"))
+                    continue
+                profiles.sort(key=lambda pc: abs(_shoelace_area(pc[0])), reverse=True)
+                profile_pts, (pkind, pparams) = profiles[0]
+                # Figure out the shift required to push the profile entirely off
+                # the axis. For Y-axis revolve: shift X so min_x >= 0 (with a
+                # small clearance). For X-axis revolve: shift Y so min_y >= 0.
+                xs = [p[0] for p in profile_pts]; ys = [p[1] for p in profile_pts]
+                if op.axis in ("Y", "Y_canvas"):
+                    shift_x = max(0.0, -min(xs)) + 0.1
+                    shift_y = 0.0
+                else:
+                    shift_x = 0.0
+                    shift_y = max(0.0, -min(ys)) + 0.1
+                # Re-build the face with the shift applied to the params.
+                if pkind == "circle":
+                    pparams = dict(pparams)
+                    pparams["cx"] += shift_x; pparams["cy"] += shift_y
+                elif pkind == "rect":
+                    pparams = dict(pparams)
+                    pparams["cx"] += shift_x; pparams["cy"] += shift_y
+                else:
+                    pparams = {"points": [(x + shift_x, y + shift_y) for x, y in pparams["points"]]}
+                profile = _make_face(pkind, pparams)
+                if op.axis in ("Y", "Y_canvas"):
+                    axis_start, axis_end = (0, -1000, 0), (0, 1000, 0)
+                else:
+                    axis_start, axis_end = (-1000, 0, 0), (1000, 0, 0)
+                try:
+                    solid = profile.revolve(op.angle_deg, axis_start, axis_end)
+                except Exception as e:
+                    feedback.append(OpFeedback(index=i, op=op.op, status="error",
+                                                summary=f"revolve failed: {type(e).__name__}: {e}"))
+                    continue
+                if model is None:
+                    model = solid
+                else:
+                    model = model.union(solid)
+                feedback.append(OpFeedback(index=i, op=op.op, status="ok",
+                                            summary=f"revolve {op.angle_deg:.0f}° around {op.axis}"))
+
+            elif isinstance(op, ShellOp):
+                if model is None:
+                    feedback.append(OpFeedback(index=i, op=op.op, status="error",
+                                                summary="cannot shell empty model"))
+                    continue
+                # CadQuery: .faces(selector).shell(thickness). Selecting the top
+                # face by default; the user can change with `remove`.
+                sel = {"top": ">Z", "bottom": "<Z", "none": None}[op.remove]
+                try:
+                    if sel is None:
+                        # Shell with no face removed isn't really meaningful in CadQuery
+                        # — treat as "thicken inward" which CQ doesn't directly support.
+                        # Fall back to removing the top face anyway.
+                        sel = ">Z"
+                    model = model.faces(sel).shell(-op.thickness_mm)
+                    feedback.append(OpFeedback(index=i, op=op.op, status="ok",
+                                                summary=f"shell {op.thickness_mm:.1f}mm, removed {op.remove} face"))
+                except Exception as e:
+                    feedback.append(OpFeedback(index=i, op=op.op, status="error",
+                                                summary=f"shell failed: {type(e).__name__}: {e}"))
+
+            elif isinstance(op, CircularPatternOp):
+                if model is None:
+                    feedback.append(OpFeedback(index=i, op=op.op, status="error",
+                                                summary="cannot pattern empty model"))
+                    continue
+                # Find the most recent hole op to replicate.
+                pattern_target = None
+                for prev_idx in range(i - 1, -1, -1):
+                    if isinstance(req.operations[prev_idx], HoleOp):
+                        pattern_target = req.operations[prev_idx]
+                        break
+                if pattern_target is None:
+                    feedback.append(OpFeedback(index=i, op=op.op, status="error",
+                                                summary="no prior hole op to pattern"))
+                    continue
+                # Place `count` copies on a circle of given radius around (cx, cy).
+                import math as _m
+                for k in range(op.count):
+                    angle = 2 * _m.pi * k / op.count
+                    px = op.cx_mm + op.radius_mm * _m.cos(angle)
+                    py = op.cy_mm + op.radius_mm * _m.sin(angle)
+                    drill = (cq.Workplane("XY")
+                             .center(px, py)
+                             .circle(pattern_target.diameter_mm / 2)
+                             .extrude(1000)
+                             .translate((0, 0, -500)))
+                    model = model.cut(drill)
+                feedback.append(OpFeedback(index=i, op=op.op, status="ok",
+                                            summary=f"circular pattern {op.count}× r={op.radius_mm}mm"))
 
             else:
                 feedback.append(OpFeedback(index=i, op=getattr(op, "op", "?"),
@@ -851,11 +1275,10 @@ def parse_prompt(text: str) -> tuple[list[Op], list[str]]:
     """
     ops: list[Op] = []
     unparsed: list[str] = []
-
-    # Split on newlines or periods or semicolons. Strip extra spaces.
-    raw_parts = re.split(r'[.;\n]', text)
+    # Split on newlines, semicolons, and periods that are NOT inside numbers
+    # (don't break "0.5mm" or "12.7mm").
+    raw_parts = re.split(r'(?:\n|;|(?<!\d)\.(?!\d))', text)
     parts = [p.strip() for p in raw_parts if p.strip()]
-
     for part in parts:
         op = _parse_one(part)
         if op is not None:
@@ -871,54 +1294,94 @@ _NUMBER = r"(\d+(?:\.\d+)?)"
 def _parse_one(line: str) -> Optional[Op]:
     s = line.lower().strip()
 
-    # Fillet: "fillet [all|top|bottom|vertical] edges X mm" or "fillet X mm"
-    m = re.search(rf"fillet\s+(?:(all|top|bottom|vertical)\s+(?:edges?\s+)?)?{_NUMBER}\s*mm", s)
-    if m:
-        target = m.group(1) or "all"
-        return FilletOp(radius_mm=float(m.group(2)), target=target)
-    # "round the corners X mm"
-    m = re.search(rf"round\s+(?:the\s+)?corners?\s+{_NUMBER}\s*mm", s)
-    if m:
-        return FilletOp(radius_mm=float(m.group(1)), target="vertical")
+    # First, extract any clear target keyword.
+    target = _extract_target(s)
 
-    # Chamfer: "chamfer [all|top|bottom|vertical] edges X mm"
-    m = re.search(rf"chamfer\s+(?:(all|top|bottom|vertical)\s+(?:edges?\s+)?)?{_NUMBER}\s*mm", s)
-    if m:
-        target = m.group(1) or "all"
-        return ChamferOp(distance_mm=float(m.group(2)), target=target)
+    # Fillet / "round the corners/edges"
+    if re.search(r"\b(fillet|round)\b", s):
+        m = re.search(rf"{_NUMBER}\s*mm", s)
+        if m:
+            r = float(m.group(1))
+            t = target
+            if t is None and re.search(r"\bcorner", s):
+                t = "vertical"
+            return FilletOp(radius_mm=r, target=t or "all")
 
-    # Set height: "make it/the part X mm tall/high/thick"
-    m = re.search(rf"(?:make\s+(?:it|the\s+part|the\s+height)\s+)?{_NUMBER}\s*mm\s*(?:tall|high|thick)", s)
-    if m:
-        return SetHeightOp(value_mm=float(m.group(1)))
-    m = re.search(rf"height\s+(?:is\s+|=\s*)?{_NUMBER}\s*mm", s)
-    if m:
-        return SetHeightOp(value_mm=float(m.group(1)))
+    # Chamfer / "bevel"
+    if re.search(r"\b(chamfer|bevel)\b", s):
+        m = re.search(rf"{_NUMBER}\s*mm", s)
+        if m:
+            return ChamferOp(distance_mm=float(m.group(1)), target=target or "all")
 
-    # Add hole: "add a X mm hole at center" / "X mm hole at (10, 20)"
-    m = re.search(rf"(?:add\s+(?:a\s+)?)?{_NUMBER}\s*mm\s+hole(?:\s+at\s+(center|origin|\(\s*-?{_NUMBER}\s*,\s*-?{_NUMBER}\s*\)))?", s)
+    # Set height: "make it X mm tall/high/thick" / "height X mm" / "X mm thick"
+    m = re.search(rf"(?:height\s+(?:is\s+|=\s*)?|{_NUMBER}\s*mm\s*(?:tall|high|thick|deep))", s)
     if m:
-        dia = float(m.group(1))
-        loc = m.group(2)
+        # Need to extract the number; do a second search.
+        m2 = re.search(rf"{_NUMBER}\s*mm", s)
+        if m2 and re.search(r"\b(tall|high|thick|deep|height)\b", s):
+            return SetHeightOp(value_mm=float(m2.group(1)))
+
+    # Hole
+    if "hole" in s:
+        # Diameter — accept "5mm", "ø5", "diameter 5"
+        d = None
+        m = re.search(rf"(?:⌀|\bdia(?:meter)?\b\s*)?{_NUMBER}\s*mm", s)
+        if m:
+            d = float(m.group(1))
+        # Location keywords
         x, y = 0.0, 0.0
-        if loc and loc not in ("center", "origin"):
-            mm = re.match(rf"\(\s*(-?{_NUMBER})\s*,\s*(-?{_NUMBER})\s*\)", loc)
+        if "top right" in s or "upper right" in s:
+            x, y = 15, 15
+        elif "top left" in s or "upper left" in s:
+            x, y = -15, 15
+        elif "bottom right" in s or "lower right" in s:
+            x, y = 15, -15
+        elif "bottom left" in s or "lower left" in s:
+            x, y = -15, -15
+        else:
+            mm = re.search(rf"\(\s*(-?{_NUMBER})\s*,\s*(-?{_NUMBER})\s*\)", s)
             if mm:
                 x = float(mm.group(1)); y = float(mm.group(3))
-        return HoleOp(x_mm=x, y_mm=y, diameter_mm=dia, plane="top")
+        if d is not None:
+            return HoleOp(x_mm=x, y_mm=y, diameter_mm=d, plane="top")
 
-    # Mirror: "mirror across X" / "mirror across YZ"
-    m = re.search(r"mirror(?:\s+across)?\s+(yz|xz|x|y)", s)
-    if m:
-        token = m.group(1).upper()
+    # Mirror
+    m = re.search(r"mirror(?:\s+(?:it|across))?\s*(yz|xz|x\b|y\b)?", s)
+    if m and "mirror" in s:
+        token = (m.group(1) or "yz").upper()
         plane = "YZ" if token in ("YZ", "X") else "XZ"
         return MirrorOp(plane=plane)
 
-    # Pattern linear: "pattern N along X every D mm" / "N along x every D mm"
-    m = re.search(rf"(?:pattern\s+)?{_NUMBER}\s+(?:along|linear)\s+(x|y)\s+every\s+{_NUMBER}\s*mm", s)
+    # Pattern linear
+    m = re.search(rf"(?:pattern\s+)?{_NUMBER}\s+(?:along|linear)\s+(x|y)\s+(?:every\s+)?{_NUMBER}\s*mm", s)
     if m:
         return PatternLinearOp(count=int(float(m.group(1))), axis=m.group(2), spacing_mm=float(m.group(3)))
 
+    # Circular pattern
+    m = re.search(rf"(?:circular\s+)?pattern\s+{_NUMBER}\s+(?:around|circular).*?{_NUMBER}\s*mm", s)
+    if m:
+        return CircularPatternOp(count=int(float(m.group(1))), radius_mm=float(m.group(2)))
+
+    # Shell / hollow
+    if re.search(r"\b(shell|hollow)\b", s):
+        m = re.search(rf"{_NUMBER}\s*mm", s)
+        if m:
+            t = "bottom" if "from bottom" in s or "open bottom" in s else "top"
+            return ShellOp(thickness_mm=float(m.group(1)), remove=t)
+
+    return None
+
+
+def _extract_target(s: str) -> Optional[str]:
+    """Pull a target keyword out of free text. Returns 'top'/'bottom'/'vertical'/'all' or None."""
+    if re.search(r"\b(top|upper)\s+(edge|edges|face|faces|side)\b", s) or re.search(r"\b(edge|edges)\s+(at|on)\s+the\s+top\b", s):
+        return "top"
+    if re.search(r"\b(bottom|lower)\s+(edge|edges|face|faces|side)\b", s) or re.search(r"\bevery\s+edge\s+that\s+touches\s+the\s+bottom\b", s):
+        return "bottom"
+    if re.search(r"\bvertical\s+(edge|edges|corner|corners)\b", s) or re.search(r"\bcorner|corners\b", s) and "vertical" in s:
+        return "vertical"
+    if re.search(r"\b(all|every)\s+(edge|edges)\b", s):
+        return "all"
     return None
 
 

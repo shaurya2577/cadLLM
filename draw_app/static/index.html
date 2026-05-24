@@ -27,13 +27,39 @@
           <option value="bottom">Bottom of last extrude</option>
         </select>
       </label>
+      <label>Mode
+        <select id="mode" title="Boolean operation for the sketch_extrude">
+          <option value="join">Join (union)</option>
+          <option value="new_body">New body</option>
+          <option value="cut">Cut</option>
+          <option value="intersect">Intersect</option>
+        </select>
+      </label>
+      <label class="check"><input id="construction" type="checkbox" /> Construction <span class="kbd-hint">(X)</span></label>
       <label class="check"><input id="snap" type="checkbox" /> Snap</label>
       <label class="check"><input id="live" type="checkbox" checked /> Live</label>
-      <button id="generate">Build</button>
-      <button id="undo" title="Remove the last stroke">Undo stroke</button>
-      <button id="clear">Clear</button>
-      <button id="save">Save as part…</button>
-      <span id="status" class="muted">Ready. Draw a closed shape, then click on or near it to annotate.</span>
+      <button id="generate" title="Build (E)">Build</button>
+      <button id="undo" title="Undo last stroke (Ctrl+Z)">Undo</button>
+      <button id="clear" title="Clear (Shift+C)">Clear</button>
+      <div class="dropdown" id="downloadMenu">
+        <button id="downloadBtn" title="Export">Export ▾</button>
+        <div class="dropdown-content">
+          <a href="#" data-format="stl">STL (printing)</a>
+          <a href="#" data-format="step">STEP (CAD)</a>
+          <a href="#" data-format="3mf">3MF (slicer)</a>
+          <a href="#" data-format="glb">GLB (web)</a>
+          <a href="#" data-format="obj">OBJ (mesh)</a>
+        </div>
+      </div>
+      <button id="save" title="Save as part (Ctrl+S)">Save…</button>
+      <button id="partsBtn" title="Open existing part (Ctrl+O)">Open ▸</button>
+      <div class="dropdown" id="hardwareMenu">
+        <button id="hardwareBtn" title="Insert standard hardware as ops">Hardware ▾</button>
+        <div class="dropdown-content" id="hardwareList"></div>
+      </div>
+      <button id="shareBtn" title="Copy a URL that recreates this model">Share</button>
+      <button id="help" title="Help (?)">?</button>
+      <span id="status" class="muted">Ready. Press <kbd>?</kbd> for shortcuts.</span>
     </div>
   </header>
 
@@ -41,18 +67,17 @@
     <section class="pane canvas-pane">
       <div class="pane-head">
         <h2>Sketch</h2>
-        <span class="muted small">click a stroke to annotate · click empty canvas for a command</span>
+        <span id="dofPill" class="dof-pill muted small">no sketch yet</span>
       </div>
       <div class="canvas-wrap">
         <canvas id="sketch" width="600" height="600"></canvas>
-        <!-- Floating inline input — positioned absolutely over the canvas when active. -->
         <div id="inlineInput" class="inline-input hidden">
           <input id="inlineInputField" type="text" placeholder="" autocomplete="off" />
           <div id="inlineInputHelp" class="inline-help"></div>
         </div>
       </div>
       <div class="prompt-row">
-        <input id="globalPrompt" type="text" placeholder="Or type a global command:  e.g. fillet all edges 2mm" />
+        <input id="globalPrompt" type="text" placeholder="Type a command (D for dimension, F for fillet)…  e.g. fillet all edges 2mm" />
         <button id="globalPromptGo">↵</button>
       </div>
       <div class="interpretation" id="interpretation"></div>
@@ -61,16 +86,92 @@
     <section class="pane viewer-pane">
       <div class="pane-head">
         <h2>3D model</h2>
-        <span class="muted small">drag to orbit · scroll to zoom</span>
+        <span id="meshPill" class="dof-pill muted small">no model yet</span>
       </div>
-      <div id="viewer"></div>
+      <div class="viewer-wrap">
+        <div id="viewer"></div>
+        <div id="viewcube" class="viewcube" title="Click a face to snap the camera">
+          <button data-view="iso">ISO</button>
+          <button data-view="top">TOP</button>
+          <button data-view="front">FR</button>
+          <button data-view="right">RT</button>
+        </div>
+      </div>
       <div class="timeline-head">
         <h3>Timeline</h3>
-        <span class="muted small">ordered ops · click × to remove</span>
+        <span class="muted small">ordered ops · click × to remove · drag slider to roll back</span>
+      </div>
+      <div class="rollback-row">
+        <input id="rollback" type="range" min="0" max="0" value="0" step="1" title="Roll back to this op (Fusion-style)"/>
+        <span id="rollbackLabel" class="muted small">all ops</span>
       </div>
       <ol id="timeline" class="timeline"></ol>
+      <div class="inspect-row">
+        <button id="inspectBtn" class="small-btn">Inspect mesh</button>
+        <span id="inspect" class="muted small"></span>
+      </div>
+      <div class="clip-row">
+        <label class="muted small">Clip Z:</label>
+        <input id="clipZ" type="range" min="0" max="100" value="100" step="1"/>
+        <span id="clipZLabel" class="muted small">no clip</span>
+      </div>
     </section>
   </main>
+
+  <!-- Parts gallery (modal) -->
+  <div id="partsModal" class="modal hidden">
+    <div class="modal-content">
+      <header><h2>Open part</h2><button id="partsClose" class="ghost">×</button></header>
+      <ul id="partsList" class="parts-list">Loading…</ul>
+    </div>
+  </div>
+
+  <!-- Help overlay -->
+  <div id="helpModal" class="modal hidden">
+    <div class="modal-content">
+      <header><h2>Keyboard shortcuts &amp; phrases</h2><button id="helpClose" class="ghost">×</button></header>
+      <div class="help-grid">
+        <section>
+          <h3>Keys</h3>
+          <table>
+            <tr><td><kbd>D</kbd></td><td>focus dimension/command prompt</td></tr>
+            <tr><td><kbd>F</kbd></td><td>prefill "fillet 2mm"</td></tr>
+            <tr><td><kbd>C</kbd></td><td>prefill "chamfer 1mm"</td></tr>
+            <tr><td><kbd>H</kbd></td><td>prefill "5mm hole at center"</td></tr>
+            <tr><td><kbd>M</kbd></td><td>add "mirror across YZ"</td></tr>
+            <tr><td><kbd>E</kbd></td><td>build now</td></tr>
+            <tr><td><kbd>X</kbd></td><td>toggle construction stroke mode</td></tr>
+            <tr><td><kbd>Ctrl+Z</kbd></td><td>undo last stroke</td></tr>
+            <tr><td><kbd>Ctrl+S</kbd></td><td>save as part</td></tr>
+            <tr><td><kbd>Ctrl+O</kbd></td><td>open existing part</td></tr>
+            <tr><td><kbd>Shift+C</kbd></td><td>clear all</td></tr>
+            <tr><td><kbd>?</kbd></td><td>this help</td></tr>
+          </table>
+        </section>
+        <section>
+          <h3>Phrases the parser understands</h3>
+          <ul>
+            <li><code>fillet all edges 2mm</code> · <code>round the corners 3mm</code></li>
+            <li><code>chamfer 1mm on the bottom</code> · <code>bevel 0.5mm</code></li>
+            <li><code>5mm hole at center</code> · <code>6mm hole at top right</code></li>
+            <li><code>make it 30mm tall</code> · <code>height 15mm</code></li>
+            <li><code>mirror</code> · <code>mirror across XZ</code></li>
+            <li><code>pattern 4 along x every 20mm</code></li>
+            <li><code>circular pattern 6 around 25mm</code></li>
+            <li><code>hollow 2mm wall</code> · <code>shell 1.5mm open top</code></li>
+          </ul>
+          <p class="muted small">Anything else gets handed to Claude (if your API key has credits) — the LLM fallback converts free-form English to structured ops.</p>
+        </section>
+        <section>
+          <h3>Sketch click-actions</h3>
+          <ul>
+            <li>Click on/near a stroke → inline input opens anchored to it. Type <code>⌀10mm</code>, <code>width 30mm</code>, etc. The drawing rescales.</li>
+            <li>Click empty canvas → inline input opens as a global command.</li>
+          </ul>
+        </section>
+      </div>
+    </div>
+  </div>
 
   <script type="module" src="/static/app.js"></script>
 </body>
