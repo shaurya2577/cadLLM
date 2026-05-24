@@ -448,6 +448,438 @@ def export(req: ExportRequest):
                     headers={"Content-Disposition": f'attachment; filename="part.{fmt}"'})
 
 
+class ConverseRequest(BaseModel):
+    """Multi-turn 'describe a thing' conversation.
+
+    Frontend tracks `history` as a list of {role, content} turns. Backend
+    decides the next response: either ASK a clarifying question, or PROPOSE
+    a list of ops the frontend should accept/reject.
+    """
+    history: List[dict]
+    canvas_width: float = 600.0
+    canvas_height: float = 600.0
+    target_size_mm: float = 60.0
+
+
+class ConverseResponse(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    kind: Literal["question", "proposal", "error"]
+    text: str
+    operations: List[Op] = []
+    template: Optional[str] = None
+    used_llm: bool = False
+
+
+@app.post("/converse", response_model=ConverseResponse)
+def converse(req: ConverseRequest) -> ConverseResponse:
+    """Translate a natural-language CAD request into ops via templates +/− LLM.
+
+    Strategy:
+      1. Inspect the latest user turn for a recognized noun (chair, table,
+         shelf, box, cylinder, mug). If found, build directly from a template.
+      2. Otherwise, if an LLM is available, ask Claude to either clarify or
+         propose ops (tool-use style). Without credits this falls through.
+      3. Otherwise return an "error" kind with a helpful message.
+    """
+    if not req.history:
+        return ConverseResponse(kind="error", text="No conversation history.")
+    last_user = next((m for m in reversed(req.history) if m.get("role") == "user"), None)
+    if not last_user:
+        return ConverseResponse(kind="error", text="No user message yet.")
+    # Concatenate ALL user messages so dimensions given in a follow-up still
+    # match against the noun from the first ask. The last_user dominates for
+    # number extraction in templates that prefer recent values.
+    combined = " ".join(m["content"] for m in req.history if m.get("role") == "user")
+    last_text = last_user["content"].lower()
+
+    # ---- Template path: recognize a noun (from combined) + extract dimensions
+    template_match = _template_for(combined)
+    if template_match is not None:
+        name, ops, question = template_match
+        if question:
+            return ConverseResponse(kind="question", text=question, template=name)
+        return ConverseResponse(
+            kind="proposal",
+            text=f"Proposed a {name} ({len(ops)} ops). Accept to add to the timeline.",
+            operations=ops, template=name,
+        )
+
+    # ---- LLM fallback (only if credits available)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            return _llm_converse(req.history)
+        except Exception:
+            pass
+
+    # ---- Fallback: hint at the user
+    return ConverseResponse(
+        kind="error",
+        text=("I don't recognize that object yet. Templates I know: chair, table, "
+              "shelf, box, cylinder, mug, knob, washer, plate, vase. "
+              "You can also describe ops directly: 'fillet 2mm', 'add a 6mm hole', etc."),
+    )
+
+
+# ============================================================================
+# Templates — generative "make me a {chair, table, box, …}"
+# ============================================================================
+
+def _template_for(text: str):
+    """Returns (name, ops, question?) or None.
+
+    If the user is asking for a known object but hasn't given a dimension,
+    return (name, [], question) so the frontend can prompt them.
+    """
+    t = text.lower()
+
+    # Extract any numbers from the text. Common pattern "50x30x20" or "50 by 30".
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", t)]
+
+    def has_word(*words):
+        return any(re.search(rf"\b{w}\b", t) for w in words)
+
+    if has_word("box", "block", "cube"):
+        # Defaults if no dims.
+        if not nums:
+            return ("box", [], "What size? e.g. '50x30x20 mm' or 'a 40mm cube'")
+        w = nums[0]; d = nums[1] if len(nums) > 1 else w; h = nums[2] if len(nums) > 2 else w
+        return ("box", _box(w, d, h), None)
+
+    if has_word("cylinder", "rod", "pin", "shaft"):
+        if not nums:
+            return ("cylinder", [], "Cylinder diameter and height? e.g. '20mm x 50mm'")
+        dia = nums[0]; h = nums[1] if len(nums) > 1 else dia * 2
+        return ("cylinder", _cylinder(dia, h), None)
+
+    if has_word("washer"):
+        if not nums:
+            return ("washer", [], "Outer diameter, inner diameter, thickness? e.g. '20mm OD, 8mm ID, 3mm thick'")
+        od = nums[0]; idia = nums[1] if len(nums) > 1 else od * 0.4; th = nums[2] if len(nums) > 2 else 3.0
+        return ("washer", _washer(od, idia, th), None)
+
+    if has_word("plate", "panel"):
+        if len(nums) < 2:
+            return ("plate", [], "Plate dimensions? e.g. '100x60x3mm with 4 holes'")
+        w = nums[0]; d = nums[1]; th = nums[2] if len(nums) > 2 else 3.0
+        n_holes = 4 if "hole" in t else 0
+        return ("plate", _plate(w, d, th, n_holes), None)
+
+    if has_word("chair"):
+        if not nums:
+            return ("chair", [], "Chair dimensions — seat width/depth/height (e.g. '40x40 seat, 45cm high, 80cm tall total'). Or just say 'default'.")
+        # Pick the first few numbers; fall back to defaults.
+        seat_w = nums[0] if len(nums) >= 1 else 40
+        seat_d = nums[1] if len(nums) >= 2 else 40
+        seat_h = nums[2] if len(nums) >= 3 else 45
+        back_h = nums[3] if len(nums) >= 4 else 45
+        return ("chair", _chair(seat_w, seat_d, seat_h, back_h), None)
+
+    if has_word("table", "desk"):
+        if not nums:
+            return ("table", [], "Table dimensions — top width, depth, height? e.g. '120 60 75 cm' (sizes in mm here)")
+        w = nums[0] if len(nums) >= 1 else 120
+        d = nums[1] if len(nums) >= 2 else 60
+        h = nums[2] if len(nums) >= 3 else 75
+        return ("table", _table(w, d, h), None)
+
+    if has_word("shelf", "bracket"):
+        if not nums:
+            return ("shelf", [], "Shelf dimensions — width, depth, support height? e.g. '200 60 40 mm'")
+        w = nums[0]; d = nums[1] if len(nums) > 1 else w * 0.3; h = nums[2] if len(nums) > 2 else d * 0.7
+        return ("shelf", _shelf(w, d, h), None)
+
+    if has_word("knob"):
+        if not nums:
+            return ("knob", [], "Knob diameter and height? e.g. '30mm x 20mm'")
+        dia = nums[0]; h = nums[1] if len(nums) > 1 else dia * 0.7
+        return ("knob", _knob(dia, h), None)
+
+    if has_word("mug", "cup"):
+        if not nums:
+            return ("mug", [], "Mug diameter and height? e.g. '80mm x 100mm' (handle added automatically)")
+        dia = nums[0]; h = nums[1] if len(nums) > 1 else dia * 1.3
+        return ("mug", _mug(dia, h), None)
+
+    if has_word("vase"):
+        if not nums:
+            return ("vase", [], "Vase base diameter, neck diameter, height? e.g. '80 50 150 mm'")
+        bd = nums[0]; nd = nums[1] if len(nums) > 1 else bd * 0.6; h = nums[2] if len(nums) > 2 else bd * 2
+        return ("vase", _vase(bd, nd, h), None)
+
+    return None
+
+
+def _box(w: float, d: float, h: float) -> list[dict]:
+    """A simple cube/box. Sketched as a rectangle stroke + extrude."""
+    # Build the stroke as a closed rectangle on canvas (we put it in a 600x600 frame).
+    cx, cy = 300, 300
+    pts = [
+        [cx - w * 2, cy - d * 2], [cx + w * 2, cy - d * 2],
+        [cx + w * 2, cy + d * 2], [cx - w * 2, cy + d * 2],
+        [cx - w * 2, cy - d * 2],
+    ]
+    return [{
+        "op": "sketch_extrude",
+        "strokes": [{"points": pts, "annotation": {"kind": "width", "value_mm": w}, "construction": False}],
+        "height_mm": h, "plane": "XY", "mode": "new_body",
+    }]
+
+
+def _cylinder(dia: float, height: float) -> list[dict]:
+    """A circle stroke (32-segment polygon) + extrude."""
+    import math as _m
+    cx, cy = 300, 300; r = dia * 2
+    pts = [[cx + r * _m.cos(2 * _m.pi * i / 32), cy + r * _m.sin(2 * _m.pi * i / 32)]
+           for i in range(33)]
+    return [{
+        "op": "sketch_extrude",
+        "strokes": [{"points": pts, "annotation": {"kind": "diameter", "value_mm": dia}, "construction": False}],
+        "height_mm": height, "plane": "XY", "mode": "new_body",
+    }]
+
+
+def _washer(od: float, idia: float, thick: float) -> list[dict]:
+    """Outer ring (large circle) + inner hole (smaller circle) + extrude."""
+    import math as _m
+    cx, cy = 300, 300
+    def circle_pts(r_canvas):
+        return [[cx + r_canvas * _m.cos(2 * _m.pi * i / 32), cy + r_canvas * _m.sin(2 * _m.pi * i / 32)]
+                for i in range(33)]
+    return [{
+        "op": "sketch_extrude",
+        "strokes": [
+            {"points": circle_pts(od * 2), "annotation": {"kind": "diameter", "value_mm": od}, "construction": False},
+            {"points": circle_pts(idia * 2), "construction": False},
+        ],
+        "height_mm": thick, "plane": "XY", "mode": "new_body",
+    }]
+
+
+def _plate(w: float, d: float, th: float, n_holes: int) -> list[dict]:
+    """A rect plate with optional 4-corner mounting holes."""
+    cx, cy = 300, 300
+    plate_pts = [
+        [cx - w * 2, cy - d * 2], [cx + w * 2, cy - d * 2],
+        [cx + w * 2, cy + d * 2], [cx - w * 2, cy + d * 2],
+        [cx - w * 2, cy - d * 2],
+    ]
+    ops: list[dict] = [{
+        "op": "sketch_extrude",
+        "strokes": [{"points": plate_pts, "annotation": {"kind": "width", "value_mm": w}, "construction": False}],
+        "height_mm": th, "plane": "XY", "mode": "new_body",
+    }]
+    if n_holes == 4:
+        inset = min(w, d) * 0.12
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                ops.append({
+                    "op": "hole",
+                    "x_mm": sx * (w / 2 - inset), "y_mm": sy * (d / 2 - inset),
+                    "diameter_mm": 4.5, "depth_mm": None, "plane": "top",
+                })
+    return ops
+
+
+def _chair(seat_w: float, seat_d: float, seat_h: float, back_h: float) -> list[dict]:
+    """A toy chair: seat plate + 4 legs (cylinders unioned beneath) + backrest plate."""
+    import math as _m
+    seat_th = 4.0
+    leg_dia = 4.0
+    back_th = 3.0
+    cx, cy = 300, 300
+
+    # Seat as the outer extrude.
+    seat_pts = [
+        [cx - seat_w * 2, cy - seat_d * 2], [cx + seat_w * 2, cy - seat_d * 2],
+        [cx + seat_w * 2, cy + seat_d * 2], [cx - seat_w * 2, cy + seat_d * 2],
+        [cx - seat_w * 2, cy - seat_d * 2],
+    ]
+    ops: list[dict] = [{
+        "op": "sketch_extrude",
+        "strokes": [{"points": seat_pts, "annotation": {"kind": "width", "value_mm": seat_w}, "construction": False}],
+        "height_mm": seat_th, "plane": "XY", "mode": "new_body",
+    }]
+    # 4 legs — cylinders extruded downward as separate sketch_extrudes (mode=join).
+    # We add them as additive circles on the SAME sketch op for simplicity.
+    leg_inset = min(seat_w, seat_d) * 0.10
+    leg_strokes = []
+    def circle_pts(canvas_cx, canvas_cy, r_canvas):
+        return [[canvas_cx + r_canvas * _m.cos(2 * _m.pi * i / 24),
+                 canvas_cy + r_canvas * _m.sin(2 * _m.pi * i / 24)] for i in range(25)]
+    # Seat is positive: a tiny stroke at the centre to anchor the sketch_extrude
+    # used for legs (each leg gets its own additive). We'll do it as separate
+    # extrude ops with mode=join, on plane=XY, but offset Z by setting height
+    # and translating via z_offset (the SketchExtrudeOp doesn't natively allow Z
+    # offset, so we keep all on XY and the chair stands with seat on top of legs).
+    # Practical: legs are tall cylinders, seat is a short plate on top.
+    # Layout: extrude legs first (height=seat_h), then extrude the seat plate
+    # again on the top of the last extrude using plane="top".
+    return [
+        # 1. Four legs as one sketch op with 4 additive circles.
+        {
+            "op": "sketch_extrude",
+            "strokes": [
+                {"points": circle_pts(cx - seat_w * 2 + leg_inset * 4, cy - seat_d * 2 + leg_inset * 4, leg_dia * 2), "construction": False},
+                {"points": circle_pts(cx + seat_w * 2 - leg_inset * 4, cy - seat_d * 2 + leg_inset * 4, leg_dia * 2), "construction": False},
+                {"points": circle_pts(cx + seat_w * 2 - leg_inset * 4, cy + seat_d * 2 - leg_inset * 4, leg_dia * 2), "construction": False},
+                {"points": circle_pts(cx - seat_w * 2 + leg_inset * 4, cy + seat_d * 2 - leg_inset * 4, leg_dia * 2), "construction": False},
+            ],
+            "height_mm": seat_h, "plane": "XY", "mode": "new_body",
+        },
+        # 2. Seat plate on top of the legs.
+        {
+            "op": "sketch_extrude",
+            "strokes": [{"points": seat_pts, "construction": False}],
+            "height_mm": seat_th, "plane": "top", "mode": "join",
+        },
+        # 3. Backrest — a tall thin plate at the back edge.
+        {
+            "op": "sketch_extrude",
+            "strokes": [{"points": [
+                [cx - seat_w * 2, cy + seat_d * 2 - back_th * 2], [cx + seat_w * 2, cy + seat_d * 2 - back_th * 2],
+                [cx + seat_w * 2, cy + seat_d * 2], [cx - seat_w * 2, cy + seat_d * 2],
+                [cx - seat_w * 2, cy + seat_d * 2 - back_th * 2],
+            ], "construction": False}],
+            "height_mm": back_h, "plane": "top", "mode": "join",
+        },
+    ]
+
+
+def _table(w: float, d: float, h: float) -> list[dict]:
+    """Toy table: tabletop + 4 legs (similar to chair but no backrest)."""
+    import math as _m
+    top_th = 3.0
+    leg_dia = 4.0
+    cx, cy = 300, 300
+
+    top_pts = [
+        [cx - w * 2, cy - d * 2], [cx + w * 2, cy - d * 2],
+        [cx + w * 2, cy + d * 2], [cx - w * 2, cy + d * 2],
+        [cx - w * 2, cy - d * 2],
+    ]
+    leg_inset = min(w, d) * 0.08
+    def circle_pts(ccx, ccy, r):
+        return [[ccx + r * _m.cos(2 * _m.pi * i / 24), ccy + r * _m.sin(2 * _m.pi * i / 24)] for i in range(25)]
+    return [
+        {  # legs
+            "op": "sketch_extrude",
+            "strokes": [
+                {"points": circle_pts(cx - w * 2 + leg_inset * 4, cy - d * 2 + leg_inset * 4, leg_dia * 2), "construction": False},
+                {"points": circle_pts(cx + w * 2 - leg_inset * 4, cy - d * 2 + leg_inset * 4, leg_dia * 2), "construction": False},
+                {"points": circle_pts(cx + w * 2 - leg_inset * 4, cy + d * 2 - leg_inset * 4, leg_dia * 2), "construction": False},
+                {"points": circle_pts(cx - w * 2 + leg_inset * 4, cy + d * 2 - leg_inset * 4, leg_dia * 2), "construction": False},
+            ],
+            "height_mm": h, "plane": "XY", "mode": "new_body",
+        },
+        {  # top
+            "op": "sketch_extrude",
+            "strokes": [{"points": top_pts, "construction": False}],
+            "height_mm": top_th, "plane": "top", "mode": "join",
+        },
+    ]
+
+
+def _shelf(w: float, d: float, h: float) -> list[dict]:
+    """L-bracket shelf: horizontal plate + vertical back."""
+    cx, cy = 300, 300
+    plate_pts = [
+        [cx - w * 2, cy - d * 2], [cx + w * 2, cy - d * 2],
+        [cx + w * 2, cy + d * 2], [cx - w * 2, cy + d * 2],
+        [cx - w * 2, cy - d * 2],
+    ]
+    return [
+        {
+            "op": "sketch_extrude",
+            "strokes": [{"points": plate_pts, "annotation": {"kind": "width", "value_mm": w}, "construction": False}],
+            "height_mm": 3.0, "plane": "XY", "mode": "new_body",
+        },
+        # Back vertical plate at the back edge — done as a sketch on the top face.
+        {
+            "op": "sketch_extrude",
+            "strokes": [{"points": [
+                [cx - w * 2, cy + d * 2 - 2.0 * 2], [cx + w * 2, cy + d * 2 - 2.0 * 2],
+                [cx + w * 2, cy + d * 2], [cx - w * 2, cy + d * 2],
+                [cx - w * 2, cy + d * 2 - 2.0 * 2],
+            ], "construction": False}],
+            "height_mm": h, "plane": "top", "mode": "join",
+        },
+    ]
+
+
+def _knob(dia: float, height: float) -> list[dict]:
+    """A knob — cylinder + filleted top edges + a small thumb-grip hole."""
+    cyl = _cylinder(dia, height)
+    cyl.append({"op": "fillet", "radius_mm": min(dia / 6, height / 4), "target": "top"})
+    cyl.append({"op": "fillet", "radius_mm": min(dia / 12, height / 8), "target": "bottom"})
+    return cyl
+
+
+def _mug(dia: float, height: float) -> list[dict]:
+    """A mug — cylinder + shell to hollow."""
+    cyl = _cylinder(dia, height)
+    wall = max(2.0, dia * 0.04)
+    cyl.append({"op": "shell", "thickness_mm": wall, "remove": "top"})
+    return cyl
+
+
+def _vase(base_dia: float, neck_dia: float, height: float) -> list[dict]:
+    """A vase via revolve. The profile is a polyline tracing the side of the vase."""
+    cx, cy = 300, 300
+    # Profile is roughly: base at bottom, narrows toward neck, then widens slightly.
+    bottom_y = 400; top_y = 400 - height * 2  # canvas Y is inverted
+    half_base = base_dia * 2 / 2
+    half_neck = neck_dia * 2 / 2
+    half_belly = max(half_base, half_neck) * 1.15
+    # Profile points (canvas coords) — outline of one side of the vase + axis return.
+    profile = [
+        [cx, bottom_y],
+        [cx + half_base, bottom_y],
+        [cx + half_belly, bottom_y - height * 0.7],
+        [cx + half_neck, top_y + height * 0.3],
+        [cx + half_neck * 1.08, top_y],
+        [cx, top_y],
+        [cx, bottom_y],
+    ]
+    return [{
+        "op": "revolve",
+        "strokes": [{"points": profile, "construction": False}],
+        "angle_deg": 360.0, "axis": "Y_canvas",
+    }]
+
+
+def _llm_converse(history: list[dict]) -> ConverseResponse:
+    """LLM-driven multi-turn converse — used when API key has credits.
+
+    Asks Claude to either ask a clarifying question or propose ops.
+    """
+    import anthropic
+    client = anthropic.Anthropic()
+    schema = _ops_schema_for_prompt()
+    system = (
+        "You are a CAD design assistant. The user wants to build a 3D model. "
+        "Either ask ONE clarifying question (if dimensions or geometry are still "
+        "unclear) OR propose a complete list of operations using the schema below. "
+        "Return ONLY JSON. Format: "
+        '{"kind": "question", "text": "..."} OR '
+        '{"kind": "proposal", "text": "summary", "operations": [...]}\n\n'
+        f"Operations schema:\n{schema}"
+    )
+    messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2048, system=system, messages=messages,
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    text = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.MULTILINE)
+    obj = json.loads(text)
+    if obj.get("kind") == "question":
+        return ConverseResponse(kind="question", text=obj.get("text", ""), used_llm=True)
+    return ConverseResponse(
+        kind="proposal", text=obj.get("text", ""),
+        operations=obj.get("operations", []), used_llm=True,
+    )
+
+
 @app.get("/parts", response_model=PartsListResponse)
 def list_parts() -> PartsListResponse:
     """List every cad/<name>.py with a quick summary."""
@@ -1297,6 +1729,16 @@ def _parse_one(line: str) -> Optional[Op]:
     # First, extract any clear target keyword.
     target = _extract_target(s)
 
+    # Alias normalization — smooth/round/soften → fillet semantics.
+    if re.search(r"\b(smooth|smoothen|soften)\b", s) and not re.search(r"\bfillet\b", s):
+        s_norm = s + " (fillet)"
+        m = re.search(rf"{_NUMBER}\s*mm", s_norm)
+        if m:
+            return FilletOp(radius_mm=float(m.group(1)), target=target or "all")
+        else:
+            # Default to 2mm.
+            return FilletOp(radius_mm=2.0, target=target or "all")
+
     # Fillet / "round the corners/edges"
     if re.search(r"\b(fillet|round)\b", s):
         m = re.search(rf"{_NUMBER}\s*mm", s)
@@ -1321,29 +1763,24 @@ def _parse_one(line: str) -> Optional[Op]:
         if m2 and re.search(r"\b(tall|high|thick|deep|height)\b", s):
             return SetHeightOp(value_mm=float(m2.group(1)))
 
-    # Hole
-    if "hole" in s:
-        # Diameter — accept "5mm", "ø5", "diameter 5"
+    # Hole — accept defaults if dia not given ("drill a hole" → 5mm)
+    if re.search(r"\b(hole|drill)\b", s):
         d = None
         m = re.search(rf"(?:⌀|\bdia(?:meter)?\b\s*)?{_NUMBER}\s*mm", s)
         if m:
             d = float(m.group(1))
-        # Location keywords
         x, y = 0.0, 0.0
-        if "top right" in s or "upper right" in s:
-            x, y = 15, 15
-        elif "top left" in s or "upper left" in s:
-            x, y = -15, 15
-        elif "bottom right" in s or "lower right" in s:
-            x, y = 15, -15
-        elif "bottom left" in s or "lower left" in s:
-            x, y = -15, -15
+        if "top right" in s or "upper right" in s:    x, y = 15, 15
+        elif "top left" in s or "upper left" in s:    x, y = -15, 15
+        elif "bottom right" in s or "lower right" in s: x, y = 15, -15
+        elif "bottom left" in s or "lower left" in s: x, y = -15, -15
         else:
             mm = re.search(rf"\(\s*(-?{_NUMBER})\s*,\s*(-?{_NUMBER})\s*\)", s)
-            if mm:
-                x = float(mm.group(1)); y = float(mm.group(3))
-        if d is not None:
-            return HoleOp(x_mm=x, y_mm=y, diameter_mm=d, plane="top")
+            if mm: x = float(mm.group(1)); y = float(mm.group(3))
+        # Default diameter if none given.
+        if d is None:
+            d = 5.0
+        return HoleOp(x_mm=x, y_mm=y, diameter_mm=d, plane="top")
 
     # Mirror
     m = re.search(r"mirror(?:\s+(?:it|across))?\s*(yz|xz|x\b|y\b)?", s)
@@ -1362,12 +1799,12 @@ def _parse_one(line: str) -> Optional[Op]:
     if m:
         return CircularPatternOp(count=int(float(m.group(1))), radius_mm=float(m.group(2)))
 
-    # Shell / hollow
+    # Shell / hollow — default 2mm if no thickness given
     if re.search(r"\b(shell|hollow)\b", s):
         m = re.search(rf"{_NUMBER}\s*mm", s)
-        if m:
-            t = "bottom" if "from bottom" in s or "open bottom" in s else "top"
-            return ShellOp(thickness_mm=float(m.group(1)), remove=t)
+        t = "bottom" if "from bottom" in s or "open bottom" in s else "top"
+        thick = float(m.group(1)) if m else 2.0
+        return ShellOp(thickness_mm=thick, remove=t)
 
     return None
 

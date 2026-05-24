@@ -57,6 +57,7 @@
         <button id="hardwareBtn" title="Insert standard hardware as ops">Hardware ▾</button>
         <div class="dropdown-content" id="hardwareList"></div>
       </div>
+      <button id="chatBtn" title="Generate from a description (chair, table, box…)">💬 Generate</button>
       <button id="shareBtn" title="Copy a URL that recreates this model">Share</button>
       <button id="help" title="Help (?)">?</button>
       <span id="status" class="muted">Ready. Press <kbd>?</kbd> for shortcuts.</span>
@@ -123,6 +124,27 @@
     <div class="modal-content">
       <header><h2>Open part</h2><button id="partsClose" class="ghost">×</button></header>
       <ul id="partsList" class="parts-list">Loading…</ul>
+    </div>
+  </div>
+
+  <!-- Generate chat modal -->
+  <div id="chatModal" class="modal hidden">
+    <div class="modal-content chat-modal">
+      <header><h2>Describe what you want</h2><button id="chatClose" class="ghost">×</button></header>
+      <div class="chat-hint muted small">
+        Try: <code>make me a chair</code> · <code>create a 50x30x20 box</code> · <code>vase 80 50 150</code> · <code>mug 80 100</code> · <code>plate 100 60 3 with 4 holes</code>.
+        I'll ask for dimensions if needed, then propose ops you can accept.
+      </div>
+      <ol id="chatLog" class="chat-log"></ol>
+      <div class="chat-input-row">
+        <input id="chatInput" type="text" placeholder="Tell me what to build…" autocomplete="off" />
+        <button id="chatSend">Send</button>
+      </div>
+      <div class="chat-action-row hidden" id="chatAction">
+        <button id="chatAccept">Accept proposal</button>
+        <button id="chatReject" class="ghost-btn">Reject &amp; refine</button>
+        <span id="chatProposalSummary" class="muted small"></span>
+      </div>
     </div>
   </div>
 

@@ -299,6 +299,29 @@ main {
 .parts-list .size { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
 
 /* Help */
+.chat-modal { max-width: 600px; width: 90%; min-height: 400px; }
+.chat-hint { padding: 8px 16px; border-bottom: 1px solid var(--border); }
+.chat-hint code { background: var(--accent-soft); padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+.chat-log {
+  list-style: none; margin: 0; padding: 12px 16px;
+  flex: 1; min-height: 200px; max-height: 380px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.chat-log li { padding: 6px 10px; border-radius: 6px; max-width: 80%; font-size: 13px; }
+.chat-log li.user { align-self: flex-end; background: var(--accent); color: white; }
+.chat-log li.assistant { align-self: flex-start; background: var(--accent-soft); }
+.chat-log li.error { align-self: center; color: var(--error); border: 1px solid var(--error); }
+.chat-input-row { display: flex; padding: 8px 16px; gap: 6px; border-top: 1px solid var(--border); }
+.chat-input-row input { flex: 1; padding: 6px 10px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--fg); border-radius: 4px; font: inherit; }
+.chat-input-row button { padding: 6px 16px; background: var(--accent); color: white;
+  border: 1px solid var(--accent); border-radius: 4px; cursor: pointer; }
+.chat-action-row { display: flex; padding: 8px 16px; gap: 8px; align-items: center; border-top: 1px solid var(--border); }
+.chat-action-row.hidden { display: none; }
+.chat-action-row button { padding: 6px 16px; border-radius: 4px; cursor: pointer; }
+#chatAccept { background: var(--ok); color: white; border: 1px solid var(--ok); font-weight: 600; }
+.ghost-btn { background: var(--panel); color: var(--muted); border: 1px solid var(--border); }
+
 .help-grid {
   padding: 12px 16px;
   overflow-y: auto;

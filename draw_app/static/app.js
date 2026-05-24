@@ -61,6 +61,18 @@ const hardwareMenu = $('hardwareMenu');
 const hardwareBtn = $('hardwareBtn');
 const hardwareList = $('hardwareList');
 const shareBtn = $('shareBtn');
+const chatBtn = $('chatBtn');
+const chatModal = $('chatModal');
+const chatClose = $('chatClose');
+const chatLog = $('chatLog');
+const chatInput = $('chatInput');
+const chatSend = $('chatSend');
+const chatAction = $('chatAction');
+const chatAccept = $('chatAccept');
+const chatReject = $('chatReject');
+const chatProposalSummary = $('chatProposalSummary');
+let chatHistory = [];
+let chatProposal = null;
 
 // Standard hardware catalog — common metric socket-head cap screws.
 // Clearance hole diameters per ASME / ISO close-fit. Numbers are mm.
@@ -548,7 +560,50 @@ function initViewer() {
   scene.add(new THREE.AxesHelper(40));
 
   window.addEventListener('resize', onViewerResize);
+  // Face-picking via raycaster — clicking the top/bottom face of the current
+  // mesh sets the active sketch plane.
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  renderer.domElement.addEventListener('click', (ev) => {
+    if (!currentMesh) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const hits = raycaster.intersectObject(currentMesh, false);
+    if (!hits.length) return;
+    const n = hits[0].face.normal.clone();
+    n.transformDirection(currentMesh.matrixWorld).normalize();
+    // Snap normal to nearest axis-aligned face.
+    if (Math.abs(n.z) > 0.9) {
+      const target = n.z > 0 ? 'top' : 'bottom';
+      planeSelect.value = target;
+      flashFaceHighlight(target);
+      setStatus(`Sketch plane → ${target} face`, 'ok');
+      if (liveCheck.checked && strokes.length > 0) scheduleBuild(60);
+    } else {
+      setStatus(`Face picking supports top/bottom only (this face normal is mostly ${n.x.toFixed(2)}x, ${n.y.toFixed(2)}y).`, 'warn');
+    }
+  });
   animate();
+}
+
+let faceHighlight = null;
+function flashFaceHighlight(which) {
+  if (!currentMesh) return;
+  if (faceHighlight) { scene.remove(faceHighlight); faceHighlight.geometry.dispose(); faceHighlight.material.dispose(); faceHighlight = null; }
+  const w = currentBBox.x * 1.05, h = currentBBox.y * 1.05;
+  const z = which === 'top' ? currentBBox.z + 0.05 : -0.05;
+  const geom = new THREE.PlaneGeometry(w, h);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x2962ff, transparent: true, opacity: 0.35, side: THREE.DoubleSide,
+  });
+  faceHighlight = new THREE.Mesh(geom, mat);
+  faceHighlight.position.set(0, 0, z);
+  scene.add(faceHighlight);
+  setTimeout(() => {
+    if (faceHighlight) { scene.remove(faceHighlight); faceHighlight.geometry.dispose(); faceHighlight.material.dispose(); faceHighlight = null; }
+  }, 1500);
 }
 
 function onViewerResize() {
@@ -856,6 +911,79 @@ async function openPart(name) {
 // Help modal
 helpBtn.addEventListener('click', () => helpModal.classList.remove('hidden'));
 helpClose.addEventListener('click', () => helpModal.classList.add('hidden'));
+
+// ---- Generate chat (the "make me a chair" feature) -------------------------
+chatBtn.addEventListener('click', () => {
+  chatModal.classList.remove('hidden');
+  if (chatHistory.length === 0) {
+    pushChat('assistant', "Hi! Describe what you want me to build. e.g. 'make me a chair' or 'a 50x30x20 box with 4 holes'.");
+  }
+  setTimeout(() => chatInput.focus(), 0);
+});
+chatClose.addEventListener('click', () => chatModal.classList.add('hidden'));
+
+function pushChat(role, content, kind = '') {
+  const li = document.createElement('li');
+  li.className = `${role}${kind ? ' ' + kind : ''}`;
+  li.textContent = content;
+  chatLog.appendChild(li);
+  chatLog.scrollTop = chatLog.scrollHeight;
+  if (role === 'user' || role === 'assistant') chatHistory.push({ role, content });
+}
+
+async function chatTurn() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  chatInput.value = '';
+  pushChat('user', text);
+  chatAction.classList.add('hidden');
+  chatProposal = null;
+  try {
+    const r = await fetch('/converse', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ history: chatHistory }),
+    });
+    if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+    const j = await r.json();
+    if (j.kind === 'question') {
+      pushChat('assistant', j.text);
+    } else if (j.kind === 'proposal') {
+      const tag = j.used_llm ? ' (via LLM)' : ` (template: ${j.template || 'auto'})`;
+      pushChat('assistant', `${j.text}${tag}`);
+      chatProposal = j.operations;
+      chatProposalSummary.textContent = `${j.operations.length} op(s) ready`;
+      chatAction.classList.remove('hidden');
+    } else {
+      pushChat('assistant', j.text, 'error');
+    }
+  } catch (e) {
+    pushChat('assistant', `Error: ${e.message}`, 'error');
+  }
+}
+chatSend.addEventListener('click', chatTurn);
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') chatTurn(); });
+
+chatAccept.addEventListener('click', () => {
+  if (!chatProposal) return;
+  // Replace the current op list with the proposal so it's the entire model.
+  // (User can manually iterate from there with sketch + extra ops.)
+  strokes = [];
+  extraOps = chatProposal.slice();
+  chatProposal = null;
+  chatAction.classList.add('hidden');
+  chatModal.classList.add('hidden');
+  renderTimeline();
+  updateInterpretationPanel();
+  redraw();
+  setStatus(`Accepted proposal — ${extraOps.length} ops added.`, 'ok');
+  scheduleBuild(50);
+});
+
+chatReject.addEventListener('click', () => {
+  chatProposal = null;
+  chatAction.classList.add('hidden');
+  pushChat('assistant', "OK — tell me what to change.");
+});
 
 // Close modals with Escape
 document.addEventListener('keydown', (e) => {
