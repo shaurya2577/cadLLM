@@ -14,6 +14,13 @@ Three layered things:
 3. **`tools/catalog.py` — visual index.** Auto-generated thumbnails for every
    part in `cad/`.
 
+**Three input modalities, one model.** Drawing strokes, typed ops ("fillet
+2mm"), and full-English descriptions ("make me a chair") all flow into the
+same op list. The chair example: type the request in the **💬 Generate**
+modal, answer the dimension question, accept the proposal — 3 ops land in
+the timeline, the chair renders live, Save writes a runnable
+`cad/demo_chair.py`.
+
 ## What ships in the browser app
 
 ### Inputs
@@ -24,6 +31,11 @@ Three layered things:
 - **Global prompt** — typed natural language parsed by a regex grammar
   (chamfer, fillet, hole, mirror, pattern, shell, set-height); falls back to
   Claude API if the regex misses (wired but inert without API credits).
+- **Generate from words** (💬 button) — describe an object in English, get a
+  multi-turn chat. The backend recognizes 11 templates (box / cube / cylinder
+  / washer / plate / chair / table / shelf / knob / mug / vase) and asks for
+  dimensions if missing; otherwise proposes ops you accept. **Verified: 11/11
+  templates build to clean STLs end-to-end.**
 - **Standard hardware menu** — M3/M4/M5/M6/M8/M10 clearance-hole presets +
   dowel-shaft sizes; click to append a hole op at center.
 
